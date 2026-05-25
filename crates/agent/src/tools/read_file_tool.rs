@@ -10,9 +10,14 @@ use project::{AgentLocation, ImageItem, Project, WorktreeSettings, image_store};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use settings::Settings;
+use collections::HashSet;
+use parking_lot::Mutex;
 use std::path::Path;
 use std::sync::Arc;
+use util::ResultExt as _;
 use util::markdown::MarkdownCodeBlock;
+
+use crate::nested_rules::{discover_nested_rules, render_nested_rules};
 
 fn tool_content_err(e: impl std::fmt::Display) -> LanguageModelToolResultContent {
     LanguageModelToolResultContent::from(e.to_string())
@@ -182,6 +187,7 @@ pub struct ReadFileToolInput {
 pub struct ReadFileTool {
     project: Entity<Project>,
     action_log: Entity<ActionLog>,
+    loaded_nested_rules: Arc<Mutex<HashSet<Arc<Path>>>>,
     update_agent_location: bool,
 }
 
@@ -194,8 +200,20 @@ impl ReadFileTool {
         Self {
             project,
             action_log,
+            loaded_nested_rules: Arc::new(Mutex::new(HashSet::default())),
             update_agent_location,
         }
+    }
+
+    /// Shares the thread's set of already-surfaced nested instruction files with
+    /// this tool, so they're injected once across the whole conversation rather
+    /// than once per tool instance. See [`crate::nested_rules`].
+    pub fn with_nested_rules_tracker(
+        mut self,
+        loaded_nested_rules: Arc<Mutex<HashSet<Arc<Path>>>>,
+    ) -> Self {
+        self.loaded_nested_rules = loaded_nested_rules;
+        self
     }
 }
 
@@ -406,6 +424,33 @@ impl AgentTool for ReadFileTool {
                 return Err(tool_content_err(format!("{file_path} not found")));
             }
 
+            // Surface any sub-directory instruction files (e.g. `AGENTS.md`) that
+            // sit between the worktree root and this file and haven't been shown
+            // yet this thread. Discovery reserves the paths synchronously so
+            // concurrent reads can't inject the same file twice; failures here
+            // must never fail the read itself.
+            let nested_rules = project.read_with(cx, |project, cx| {
+                discover_nested_rules(
+                    project,
+                    &project_path,
+                    &mut self.loaded_nested_rules.lock(),
+                    cx,
+                )
+            });
+            let mut loaded_nested_rules = Vec::with_capacity(nested_rules.len());
+            for rule in &nested_rules {
+                if let Some(contents) = fs.load(rule.abs_path.as_ref()).await.log_err() {
+                    loaded_nested_rules.push((rule.display_path.as_str(), contents));
+                }
+            }
+            let nested_instructions = (!loaded_nested_rules.is_empty()).then(|| {
+                render_nested_rules(
+                    loaded_nested_rules
+                        .iter()
+                        .map(|(display_path, contents)| (*display_path, contents.as_str())),
+                )
+            });
+
             let mut anchor = None;
             let mut is_outline_response = false;
 
@@ -503,7 +548,14 @@ impl AgentTool for ReadFileTool {
                 }
             });
 
-            result
+            // Prepend nested instructions after the UI content update above, so
+            // the editor only renders the file's own contents in its code block.
+            match (result, nested_instructions) {
+                (Ok(LanguageModelToolResultContent::Text(text)), Some(block)) => {
+                    Ok(format!("{block}{text}").into())
+                }
+                (result, _) => result,
+            }
         })
     }
 
@@ -634,6 +686,87 @@ mod test {
             result.unwrap(),
             "     1\tThis is a small file content".into()
         );
+    }
+
+    #[gpui::test]
+    async fn test_read_file_surfaces_nested_rules_once(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                "AGENTS.md": "root rules",
+                "top.txt": "top level file",
+                "crates": {
+                    "foo": {
+                        "AGENTS.md": "foo rules",
+                        "bar": {
+                            "AGENTS.md": "bar rules",
+                            "baz.rs": "fn main() {}",
+                            "sibling.rs": "fn sibling() {}",
+                        },
+                    },
+                },
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+        let action_log = cx.new(|_| ActionLog::new(project.clone()));
+        // Reuse the same tool instance across reads so the per-thread dedup set
+        // persists.
+        let tool = Arc::new(ReadFileTool::new(project, action_log, true));
+
+        let read = |path: &str| {
+            let tool = tool.clone();
+            let path = path.to_string();
+            cx.update(|cx| {
+                let input = ReadFileToolInput {
+                    path,
+                    start_line: None,
+                    end_line: None,
+                };
+                tool.run(
+                    ToolInput::resolved(input),
+                    ToolCallEventStream::test().0,
+                    cx,
+                )
+            })
+        };
+
+        // First read of a deeply-nested file surfaces every nested instruction
+        // file between the worktree root (exclusive) and the file's directory,
+        // root-most first, and never the worktree-root rules file.
+        let first = result_text(read("root/crates/foo/bar/baz.rs").await.unwrap());
+        assert!(first.contains("<nested_instructions>"), "{first}");
+        assert!(first.contains("`root/crates/foo/AGENTS.md`"), "{first}");
+        assert!(first.contains("foo rules"), "{first}");
+        assert!(first.contains("`root/crates/foo/bar/AGENTS.md`"), "{first}");
+        assert!(first.contains("bar rules"), "{first}");
+        assert!(!first.contains("root rules"), "{first}");
+        assert!(first.contains("fn main() {}"), "{first}");
+        assert!(
+            first.find("foo rules").unwrap() < first.find("bar rules").unwrap(),
+            "ancestors should be ordered root-most first: {first}"
+        );
+
+        // A second read in the same directory does not re-inject the already
+        // surfaced instruction files.
+        let second = result_text(read("root/crates/foo/bar/sibling.rs").await.unwrap());
+        assert!(!second.contains("<nested_instructions>"), "{second}");
+        assert!(second.contains("fn sibling() {}"), "{second}");
+
+        // A file directly in the worktree root has no nested directories, so
+        // nothing is surfaced (the root rules file lives in the system prompt).
+        let top = result_text(read("root/top.txt").await.unwrap());
+        assert!(!top.contains("<nested_instructions>"), "{top}");
+    }
+
+    fn result_text(content: LanguageModelToolResultContent) -> String {
+        match content {
+            LanguageModelToolResultContent::Text(text) => text.to_string(),
+            other => panic!("expected text tool result, got {other:?}"),
+        }
     }
 
     #[gpui::test]

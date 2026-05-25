@@ -1,6 +1,7 @@
 mod db;
 mod legacy_thread;
 mod native_agent_server;
+mod nested_rules;
 pub mod outline;
 mod pattern_extraction;
 mod templates;

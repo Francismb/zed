@@ -3899,18 +3899,23 @@ impl ThreadView {
 
         let tooltip_separator_color = Color::Custom(cx.theme().colors().text_disabled.opacity(0.6));
 
-        let (project_rules_count, project_entry_ids) = self
+        let (project_rules_count, project_entry_ids, nested_rule_paths) = self
             .as_native_thread(cx)
             .map(|thread| {
-                let project_context = thread.read(cx).project_context().read(cx);
+                let thread = thread.read(cx);
+                let project_context = thread.project_context().read(cx);
                 let project_entry_ids = project_context
                     .worktrees
                     .iter()
                     .filter_map(|wt| wt.rules_file.as_ref())
                     .map(|rf| ProjectEntryId::from_usize(rf.project_entry_id))
                     .collect::<Vec<_>>();
-                let project_rules_count = project_entry_ids.len();
-                (project_rules_count, project_entry_ids)
+                // Nested `AGENTS.md` files surfaced on-demand as the agent read
+                // into subdirectories are folded into the same "project rules"
+                // count and opened alongside the root rules files.
+                let nested_rule_paths = thread.loaded_nested_rules();
+                let project_rules_count = project_entry_ids.len() + nested_rule_paths.len();
+                (project_rules_count, project_entry_ids, nested_rule_paths)
             })
             .unwrap_or_default();
 
@@ -3939,6 +3944,7 @@ impl ThreadView {
                 let input_max_label = input_max_label.clone();
                 let output_max_label = output_max_label.clone();
                 let project_entry_ids = project_entry_ids.clone();
+                let nested_rule_paths = nested_rule_paths.clone();
                 let workspace = workspace.clone();
                 let cost_label = cost_label.clone();
                 cx.new(move |_cx| TokenUsageTooltip {
@@ -3955,6 +3961,7 @@ impl ThreadView {
                     global_agents_md_loaded,
                     project_rules_count,
                     project_entry_ids,
+                    nested_rule_paths,
                     workspace,
                 })
                 .into()
@@ -4649,6 +4656,7 @@ struct TokenUsageTooltip {
     global_agents_md_loaded: bool,
     project_rules_count: usize,
     project_entry_ids: Vec<ProjectEntryId>,
+    nested_rule_paths: Vec<Arc<Path>>,
     workspace: WeakEntity<Workspace>,
 }
 
@@ -4667,6 +4675,7 @@ impl Render for TokenUsageTooltip {
         let global_agents_md_loaded = self.global_agents_md_loaded;
         let project_rules_count = self.project_rules_count;
         let project_entry_ids = self.project_entry_ids.clone();
+        let nested_rule_paths = self.nested_rule_paths.clone();
         let workspace = self.workspace.clone();
 
         ui::tooltip_container(cx, move |container, cx| {
@@ -4782,6 +4791,7 @@ impl Render for TokenUsageTooltip {
                                         .when(project_rules_count > 0, move |this| {
                                             let workspace = workspace.clone();
                                             let project_entry_ids = project_entry_ids.clone();
+                                            let nested_rule_paths = nested_rule_paths.clone();
                                             this.child(
                                                 Button::new(
                                                     "open-project-rules",
@@ -4810,6 +4820,22 @@ impl Render for TokenUsageTooltip {
                                                                 workspace
                                                                     .open_path(
                                                                         path, None, true, window,
+                                                                        cx,
+                                                                    )
+                                                                    .detach_and_log_err(cx);
+                                                            }
+                                                            // Nested rules live outside the
+                                                            // project entry set, so open them
+                                                            // by absolute path.
+                                                            for path in &nested_rule_paths {
+                                                                workspace
+                                                                    .open_abs_path(
+                                                                        path.to_path_buf(),
+                                                                        workspace::OpenOptions {
+                                                                            focus: Some(true),
+                                                                            ..Default::default()
+                                                                        },
+                                                                        window,
                                                                         cx,
                                                                     )
                                                                     .detach_and_log_err(cx);

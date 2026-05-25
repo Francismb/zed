@@ -51,6 +51,7 @@ use serde::{Deserialize, Serialize};
 use settings::{
     LanguageModelSelection, Settings, SettingsStore, ToolPermissionMode, update_settings_file,
 };
+use parking_lot::Mutex;
 use std::{
     collections::BTreeMap,
     marker::PhantomData,
@@ -992,6 +993,11 @@ pub struct Thread {
     pub(crate) prompt_capabilities_rx: watch::Receiver<acp::PromptCapabilities>,
     pub(crate) project: Entity<Project>,
     pub(crate) action_log: Entity<ActionLog>,
+    /// Absolute paths of sub-directory instruction files (e.g. `AGENTS.md`) that
+    /// have already been surfaced to the model during this thread, so they are
+    /// injected once rather than on every read in the same area. Shared with the
+    /// `read_file` tool. See [`crate::nested_rules`].
+    loaded_nested_rules: Arc<Mutex<HashSet<Arc<Path>>>>,
     /// True if this thread was imported from a shared thread and can be synced.
     imported: bool,
     /// If this is a subagent thread, contains context about the parent
@@ -1122,6 +1128,7 @@ impl Thread {
             prompt_capabilities_rx,
             project,
             action_log,
+            loaded_nested_rules: Arc::new(Mutex::new(HashSet::default())),
             imported: false,
             subagent_context: None,
             draft_prompt: None,
@@ -1434,6 +1441,10 @@ impl Thread {
             speed: db_thread.speed,
             project,
             action_log,
+            // Not persisted: after a reload the historical `read_file` results
+            // still contain any previously-surfaced nested instructions, so the
+            // model already has them; at worst one extra injection occurs.
+            loaded_nested_rules: Arc::new(Mutex::new(HashSet::default())),
             updated_at: db_thread.updated_at,
             prompt_capabilities_tx,
             prompt_capabilities_rx,
@@ -1503,6 +1514,16 @@ impl Thread {
 
     pub fn project_context(&self) -> &Entity<ProjectContext> {
         &self.project_context
+    }
+
+    /// Absolute paths of sub-directory instruction files (e.g. `AGENTS.md`)
+    /// surfaced to the model so far this thread, sorted for stable display.
+    /// See [`crate::nested_rules`].
+    pub fn loaded_nested_rules(&self) -> Vec<Arc<Path>> {
+        let mut paths: Vec<Arc<Path>> =
+            self.loaded_nested_rules.lock().iter().cloned().collect();
+        paths.sort();
+        paths
     }
 
     pub fn project(&self) -> &Entity<Project> {
@@ -1689,11 +1710,14 @@ impl Thread {
         if cx.has_flag::<UpdateTitleToolFeatureFlag>() {
             self.add_tool(UpdateTitleTool::new(cx.weak_entity()));
         }
-        self.add_tool(ReadFileTool::new(
-            self.project.clone(),
-            self.action_log.clone(),
-            update_agent_location,
-        ));
+        self.add_tool(
+            ReadFileTool::new(
+                self.project.clone(),
+                self.action_log.clone(),
+                update_agent_location,
+            )
+            .with_nested_rules_tracker(self.loaded_nested_rules.clone()),
+        );
         self.add_tool(TerminalTool::new(self.project.clone(), environment.clone()));
         self.add_tool(WebSearchTool);
 
