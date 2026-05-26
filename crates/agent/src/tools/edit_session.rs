@@ -297,15 +297,27 @@ pub(crate) async fn run_session(
             error,
             session: Some(session),
         } => {
-            session
-                .context
-                .ensure_buffer_saved(&session.buffer, cx)
-                .await;
-            let (_new_text, diff) = session.compute_new_text_and_diff(cx).await;
+            // Revert any partially-applied streaming edits. Saves only happen on
+            // the success path above, so nothing reached disk; resetting the
+            // in-memory buffer to its pre-edit contents leaves the file untouched,
+            // as if the edit had never run. The reset goes through the action log
+            // in the same effect cycle (like `agent_edit_buffer`) so it isn't
+            // misattributed as a user edit and the agent's tracked changes for
+            // this file return to empty.
+            cx.update(|cx| {
+                session.buffer.update(cx, |buffer, cx| {
+                    let end = buffer.len();
+                    buffer.edit([(0..end, session.old_text.to_string())], None, cx);
+                });
+                session
+                    .context
+                    .action_log
+                    .update(cx, |log, cx| log.buffer_edited(session.buffer.clone(), cx));
+            });
             Err(EditSessionOutput::Error {
                 error,
                 input_path: Some(session.input_path),
-                diff,
+                diff: String::new(),
             })
         }
         EditSessionResult::Failed {

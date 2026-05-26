@@ -909,11 +909,15 @@ mod tests {
             error.contains("Could not find matching text for edit at index 1"),
             "Expected error about edit 1 failing, got: {error}"
         );
-        // Ensure that first edit was applied successfully and that we saved the buffer
         assert_eq!(input_path, Some(PathBuf::from("root/file.txt")));
+        // On a mid-stream failure the partially-applied edits are reverted, so
+        // the reported diff is empty and the buffer is restored to its original
+        // contents (nothing was ever written to disk).
+        assert_eq!(diff, "");
+        let buffer_text = buffer.read_with(cx, |buffer, _cx| buffer.text());
         assert_eq!(
-            diff,
-            "@@ -1,3 +1,3 @@\n-line 1\n+MODIFIED\n line 2\n line 3\n"
+            buffer_text, "line 1\nline 2\nline 3\n",
+            "Buffer should be reverted to its original contents after a mid-stream failure"
         );
     }
 
