@@ -30,14 +30,16 @@ use futures::{
     future::Shared,
     stream::FuturesUnordered,
 };
-use futures::{StreamExt, stream};
+use futures::{Stream, StreamExt, stream};
 use gpui::{
-    App, AppContext, AsyncApp, Context, Entity, EventEmitter, SharedString, Task, WeakEntity,
+    App, AppContext, AsyncApp, BackgroundExecutor, Context, Entity, EventEmitter, SharedString,
+    Task, WeakEntity,
 };
 use heck::ToSnakeCase as _;
 use language_model::{
     CompletionIntent, LanguageModel, LanguageModelCompletionError, LanguageModelCompletionEvent,
-    LanguageModelId, LanguageModelImage, LanguageModelProviderId, LanguageModelRegistry,
+    LanguageModelId, LanguageModelImage, LanguageModelProviderId, LanguageModelProviderName,
+    LanguageModelRegistry,
     LanguageModelRequest, LanguageModelRequestMessage, LanguageModelRequestTool,
     LanguageModelToolResult, LanguageModelToolResultContent, LanguageModelToolSchemaFormat,
     LanguageModelToolUse, LanguageModelToolUseId, Role, SelectedModel, Speed, StopReason,
@@ -110,6 +112,66 @@ impl std::fmt::Display for PromptId {
 
 pub(crate) const MAX_RETRY_ATTEMPTS: u8 = 4;
 pub(crate) const BASE_RETRY_DELAY: Duration = Duration::from_secs(5);
+
+/// How long the model may go silent *between* events, once the stream is already
+/// flowing, before it is treated as stalled (see [`with_idle_timeout`]). The
+/// HTTP client has no read timeout, so a connection that goes silent mid-stream
+/// would otherwise hang the turn indefinitely while holding its rate-limiter
+/// permit open. The separate wait for the response to *begin* is bounded by the
+/// provider (after the permit is acquired). Chosen to be well beyond any
+/// legitimate gap, since reasoning models legitimately pause mid-stream, so this
+/// only fires on a genuinely dead connection.
+const MODEL_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Wraps a completion event stream so that, if no event arrives within
+/// [`MODEL_STREAM_IDLE_TIMEOUT`], it emits a single `StreamEndedUnexpectedly`
+/// error and ends instead of blocking forever on a silent connection. The error
+/// flows through the normal completion-error path, releasing the connection and
+/// rate-limiter permit and allowing the turn to be retried.
+fn with_idle_timeout<S>(
+    stream: S,
+    provider: LanguageModelProviderName,
+    executor: BackgroundExecutor,
+) -> impl Stream<Item = Result<LanguageModelCompletionEvent, LanguageModelCompletionError>> + Send
+where
+    S: Stream<Item = Result<LanguageModelCompletionEvent, LanguageModelCompletionError>>
+        + Send
+        + Unpin
+        + 'static,
+{
+    stream::unfold(Some(stream), move |state| {
+        let executor = executor.clone();
+        let provider = provider.clone();
+        async move {
+            let mut stream = state?;
+            // Scope the `next()` borrow so `stream` can be moved into the
+            // returned state once the race resolves.
+            let outcome = {
+                let mut next = stream.next().fuse();
+                let mut timer = executor.timer(MODEL_STREAM_IDLE_TIMEOUT).fuse();
+                futures::select_biased! {
+                    item = next => Some(item),
+                    _ = timer => None,
+                }
+            };
+            match outcome {
+                Some(Some(item)) => Some((item, Some(stream))),
+                Some(None) => None,
+                None => {
+                    log::warn!(
+                        "model stream from `{provider}` produced no output for \
+                         {MODEL_STREAM_IDLE_TIMEOUT:?}; treating the connection as stalled and \
+                         ending the stream so the turn can be retried"
+                    );
+                    Some((
+                        Err(LanguageModelCompletionError::StreamEndedUnexpectedly { provider }),
+                        None,
+                    ))
+                }
+            }
+        }
+    })
+}
 
 #[derive(Debug, Clone)]
 enum RetryStrategy {
@@ -2077,8 +2139,23 @@ impl Thread {
 
             log::debug!("Calling model.stream_completion, attempt {}", attempt);
 
+            // The wait for the response to *begin* (including any rate-limiter
+            // permit-queue time, which is legitimate back-pressure rather than a
+            // stall) is bounded by the provider, so it isn't timed here. Once the
+            // stream is flowing, `with_idle_timeout` guards the gaps *between*
+            // events so a connection that goes silent mid-response is retried
+            // rather than hanging the turn forever.
             let (mut events, mut error) = match model.stream_completion(request, cx).await {
-                Ok(events) => (events.fuse(), None),
+                Ok(events) => (
+                    with_idle_timeout(
+                        events,
+                        model.provider_name(),
+                        cx.background_executor().clone(),
+                    )
+                    .boxed()
+                    .fuse(),
+                    None,
+                ),
                 Err(err) => (stream::empty().boxed().fuse(), Some(err)),
             };
             let mut tool_results: FuturesUnordered<Task<LanguageModelToolResult>> =
@@ -3295,13 +3372,23 @@ impl Thread {
             | NoApiKey { .. }
             | ApiEndpointNotFound { .. }
             | PromptTooLarge { .. } => None,
-            // These errors might be transient, so retry them
-            SerializeRequest { .. } | BuildRequestBody { .. } | StreamEndedUnexpectedly { .. } => {
-                Some(RetryStrategy::Fixed {
-                    delay: BASE_RETRY_DELAY,
-                    max_attempts: 1,
-                })
-            }
+            // A stalled/dropped stream (including the time-to-first-byte bound
+            // the Codex provider applies after acquiring its rate-limiter permit)
+            // is transient and usually clears on a fresh request: in practice the
+            // large majority recover on the first retry, but an occasional one
+            // stalls again, so allow several attempts before surfacing a failure.
+            StreamEndedUnexpectedly { .. } => Some(RetryStrategy::Fixed {
+                delay: BASE_RETRY_DELAY,
+                max_attempts: MAX_RETRY_ATTEMPTS,
+            }),
+            // Deterministic, local request-construction failures: serializing
+            // the request struct or assembling the HTTP request. Their outcome
+            // is a pure function of inputs we already hold, so a retry re-runs
+            // the identical work and produces the identical error. Don't retry —
+            // surface the failure immediately rather than after a pointless
+            // backoff. (Distinct from the permanent-rejection group above in
+            // cause, but they share the same "no retry" outcome.)
+            SerializeRequest { .. } | BuildRequestBody { .. } => None,
             // Retry all other 4xx and 5xx errors once.
             HttpResponseError { status_code, .. }
                 if status_code.is_client_error() || status_code.is_server_error() =>
