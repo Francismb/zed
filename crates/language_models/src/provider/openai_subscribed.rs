@@ -35,6 +35,15 @@ const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CREDENTIALS_KEY: &str = "https://chatgpt.com/backend-api/codex";
 const TOKEN_REFRESH_BUFFER_MS: u64 = 5 * 60 * 1000;
 
+/// How long to wait for the Codex response to *begin* (headers + first bytes)
+/// once a request is actually on the wire. Applied *after* the rate-limiter
+/// permit is held, so it never counts time spent waiting in the permit queue
+/// (which is legitimate back-pressure, not a stall). The Codex backend
+/// sometimes accepts a connection and the request body but never starts the
+/// response; without this bound that turn would park forever. On timeout the
+/// turn surfaces a retryable `StreamEndedUnexpectedly`.
+const RESPONSE_START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct CodexCredentials {
     access_token: String,
@@ -160,6 +169,15 @@ impl OpenAiSubscribedProvider {
             model,
             state: self.state.clone(),
             http_client: self.http_client.clone(),
+            // This model instance is shared across every agent thread using a
+            // ChatGPT Subscription, so this caps total concurrent requests
+            // across all of them. Kept at 4, comfortably under the ceiling
+            // Codex's own CLI uses (it caps parallel sub-agents at 6): above
+            // that ceiling, overflow requests tend to be accepted but never get
+            // a response (connection opens, request is sent, the stream never
+            // begins). Requests beyond this limit queue on the permit
+            // (legitimate back-pressure); a genuinely stalled request is
+            // separately bounded by RESPONSE_START_TIMEOUT and retried.
             request_limiter: RateLimiter::new(4),
         })
     }
@@ -482,6 +500,7 @@ impl LanguageModel for OpenAiSubscribedLanguageModel {
         let request_limiter = self.request_limiter.clone();
 
         let future = cx.spawn(async move |cx| {
+            let executor = cx.background_executor().clone();
             let creds = get_fresh_credentials(&state, &http_client, cx).await?;
 
             let mut extra_headers: Vec<(String, String)> = vec![
@@ -497,16 +516,35 @@ impl LanguageModel for OpenAiSubscribedLanguageModel {
             let access_token = creds.access_token.clone();
             request_limiter
                 .stream(async move {
-                    stream_response(
-                        http_client.as_ref(),
-                        PROVIDER_NAME.0.as_str(),
-                        CODEX_BASE_URL,
-                        &access_token,
-                        responses_request,
-                        extra_headers,
-                    )
-                    .await
-                    .map_err(LanguageModelCompletionError::from)
+                    // The permit is held here, so this timer measures only the
+                    // wait for the response to *begin*, not the permit queue.
+                    let provider_name = PROVIDER_NAME;
+                    let mut response = std::pin::pin!(
+                        stream_response(
+                            http_client.as_ref(),
+                            provider_name.0.as_str(),
+                            CODEX_BASE_URL,
+                            &access_token,
+                            responses_request,
+                            extra_headers,
+                        )
+                        .fuse()
+                    );
+                    let mut timer = executor.timer(RESPONSE_START_TIMEOUT).fuse();
+                    futures::select_biased! {
+                        result = response => {
+                            result.map_err(LanguageModelCompletionError::from)
+                        }
+                        _ = timer => {
+                            log::warn!(
+                                "Codex response did not begin within {RESPONSE_START_TIMEOUT:?}; \
+                                 treating the connection as stalled so the turn can be retried"
+                            );
+                            Err(LanguageModelCompletionError::StreamEndedUnexpectedly {
+                                provider: PROVIDER_NAME,
+                            })
+                        }
+                    }
                 })
                 .await
         });
