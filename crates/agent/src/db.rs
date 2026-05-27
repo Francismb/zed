@@ -16,7 +16,7 @@ use sqlez::{
     connection::Connection,
     statement::Statement,
 };
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 use ui::{App, SharedString};
 use util::path_list::PathList;
 use zed_env_vars::ZED_STATELESS;
@@ -81,6 +81,8 @@ pub struct DbThread {
     pub draft_prompt: Option<Vec<acp::ContentBlock>>,
     #[serde(default)]
     pub ui_scroll_position: Option<SerializedScrollPosition>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub loaded_nested_rules: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -130,6 +132,7 @@ impl SharedThread {
             thinking_effort: None,
             draft_prompt: None,
             ui_scroll_position: None,
+            loaded_nested_rules: Vec::new(),
         }
     }
 
@@ -309,6 +312,7 @@ impl DbThread {
             thinking_effort: None,
             draft_prompt: None,
             ui_scroll_position: None,
+            loaded_nested_rules: Vec::new(),
         })
     }
 }
@@ -694,6 +698,7 @@ mod tests {
             thinking_effort: None,
             draft_prompt: None,
             ui_scroll_position: None,
+            loaded_nested_rules: Vec::new(),
         }
     }
 
@@ -917,6 +922,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_loaded_nested_rules_defaults_to_empty() {
+        let json = format!(
+            r#"{{
+            "version": "{}",
+            "title": "Old Thread",
+            "messages": [],
+            "updated_at": "2024-01-01T00:00:00Z"
+        }}"#,
+            DbThread::VERSION
+        );
+
+        let db_thread = DbThread::from_json(json.as_bytes()).expect("Failed to deserialize");
+
+        assert!(
+            db_thread.loaded_nested_rules.is_empty(),
+            "Legacy threads without loaded_nested_rules should default to empty"
+        );
+    }
+
     #[gpui::test]
     async fn test_scroll_position_roundtrips_through_save_load(cx: &mut TestAppContext) {
         let database = ThreadsDatabase::new(cx.executor()).unwrap();
@@ -948,5 +973,39 @@ mod tests {
             .expect("scroll_position should be restored");
         assert_eq!(scroll.item_ix, 42);
         assert!((scroll.offset_in_item - 13.5).abs() < f32::EPSILON);
+    }
+
+    #[gpui::test]
+    async fn test_loaded_nested_rules_roundtrips_through_save_load(cx: &mut TestAppContext) {
+        let database = ThreadsDatabase::new(cx.executor()).unwrap();
+
+        let thread_id = session_id("thread-with-nested-rules");
+        let mut thread = make_thread(
+            "Thread With Nested Rules",
+            Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
+        );
+        thread.loaded_nested_rules = vec![
+            PathBuf::from("/project/crates/foo/AGENTS.md"),
+            PathBuf::from("/project/crates/foo/bar/AGENTS.md"),
+        ];
+
+        database
+            .save_thread(thread_id.clone(), thread, PathList::default())
+            .await
+            .unwrap();
+
+        let loaded = database
+            .load_thread(thread_id)
+            .await
+            .unwrap()
+            .expect("thread should exist");
+
+        assert_eq!(
+            loaded.loaded_nested_rules,
+            vec![
+                PathBuf::from("/project/crates/foo/AGENTS.md"),
+                PathBuf::from("/project/crates/foo/bar/AGENTS.md"),
+            ]
+        );
     }
 }

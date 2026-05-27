@@ -1,4 +1,3 @@
-use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -8,6 +7,11 @@ use project::{Project, ProjectPath};
 use prompt_store::RULES_FILE_NAMES;
 use util::markdown::MarkdownCodeBlock;
 use util::rel_path::RelPath;
+
+const NESTED_INSTRUCTIONS_PREFIX: &str = "<nested_instructions>\n\
+The following instruction files apply to the directory containing the file that was just \
+read. Follow them when working in this area of the project.\n";
+const NESTED_INSTRUCTIONS_SUFFIX: &str = "</nested_instructions>\n\n";
 
 /// A sub-directory instruction file (e.g. `AGENTS.md`) discovered in a directory
 /// above a file the agent read, but below the worktree root. The worktree root's
@@ -48,8 +52,10 @@ pub fn discover_nested_rules(
     // `ancestors` yields the directory itself down to the empty root path;
     // dropping the empty path excludes the worktree root, and reversing puts the
     // root-most directory first.
-    let mut directories: Vec<&RelPath> =
-        directory.ancestors().filter(|dir| !dir.is_empty()).collect();
+    let mut directories: Vec<&RelPath> = directory
+        .ancestors()
+        .filter(|dir| !dir.is_empty())
+        .collect();
     directories.reverse();
 
     let mut rules = Vec::new();
@@ -87,26 +93,32 @@ pub fn discover_nested_rules(
 /// Renders discovered nested instruction files into a single `<nested_instructions>`
 /// block suitable for prepending to a tool result. `rules` pairs each file's
 /// display path with its (already-loaded) contents.
-pub fn render_nested_rules<'a>(
-    rules: impl IntoIterator<Item = (&'a str, &'a str)>,
-) -> String {
+pub fn render_nested_rules<'a>(rules: impl IntoIterator<Item = (&'a str, &'a str)>) -> String {
     let mut output = String::new();
-    output.push_str(
-        "<nested_instructions>\n\
-         The following instruction files apply to the directory containing the file that was just \
-         read. Follow them when working in this area of the project.\n",
-    );
+    output.push_str(NESTED_INSTRUCTIONS_PREFIX);
     for (display_path, contents) in rules {
-        let _ = write!(output, "\n`{display_path}`:\n");
-        let _ = write!(
-            output,
-            "{}",
-            MarkdownCodeBlock {
+        output.push('\n');
+        output.push('`');
+        output.push_str(display_path);
+        output.push_str("`:\n");
+        output.push_str(
+            &MarkdownCodeBlock {
                 tag: "",
                 text: contents.trim(),
             }
+            .to_string(),
         );
     }
-    output.push_str("</nested_instructions>\n\n");
+    output.push_str(NESTED_INSTRUCTIONS_SUFFIX);
     output
+}
+
+pub fn strip_nested_rules(text: &str) -> &str {
+    let Some(rest) = text.strip_prefix(NESTED_INSTRUCTIONS_PREFIX) else {
+        return text;
+    };
+    let Some((_, file_text)) = rest.split_once(NESTED_INSTRUCTIONS_SUFFIX) else {
+        return text;
+    };
+    file_text
 }

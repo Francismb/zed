@@ -4795,10 +4795,14 @@ impl Render for TokenUsageTooltip {
                                             this.child(
                                                 Button::new(
                                                     "open-project-rules",
-                                                    format!(
-                                                        "{} project rules",
-                                                        project_rules_count
-                                                    ),
+                                                    if project_rules_count == 1 {
+                                                        "1 project rule".to_string()
+                                                    } else {
+                                                        format!(
+                                                            "{} project rules",
+                                                            project_rules_count
+                                                        )
+                                                    },
                                                 )
                                                 .end_icon(
                                                     Icon::new(IconName::ArrowUpRight)

@@ -43,6 +43,7 @@ use language_model::{
     LanguageModelToolUse, LanguageModelToolUseId, Role, SelectedModel, Speed, StopReason,
     TokenUsage, ZED_CLOUD_PROVIDER_ID,
 };
+use parking_lot::Mutex;
 use project::Project;
 use prompt_store::ProjectContext;
 use schemars::{JsonSchema, Schema};
@@ -51,7 +52,6 @@ use serde::{Deserialize, Serialize};
 use settings::{
     LanguageModelSelection, Settings, SettingsStore, ToolPermissionMode, update_settings_file,
 };
-use parking_lot::Mutex;
 use std::{
     collections::BTreeMap,
     marker::PhantomData,
@@ -1441,10 +1441,14 @@ impl Thread {
             speed: db_thread.speed,
             project,
             action_log,
-            // Not persisted: after a reload the historical `read_file` results
-            // still contain any previously-surfaced nested instructions, so the
-            // model already has them; at worst one extra injection occurs.
-            loaded_nested_rules: Arc::new(Mutex::new(HashSet::default())),
+            loaded_nested_rules: Arc::new(Mutex::new(
+                db_thread
+                    .loaded_nested_rules
+                    .iter()
+                    .cloned()
+                    .map(|path| Arc::from(path.into_boxed_path()))
+                    .collect(),
+            )),
             updated_at: db_thread.updated_at,
             prompt_capabilities_tx,
             prompt_capabilities_rx,
@@ -1487,6 +1491,11 @@ impl Thread {
                     offset_in_item: lo.offset_in_item.as_f32(),
                 }
             }),
+            loaded_nested_rules: self
+                .loaded_nested_rules()
+                .into_iter()
+                .map(|path| path.as_ref().to_path_buf())
+                .collect(),
         };
 
         cx.background_spawn(async move {
@@ -1520,8 +1529,7 @@ impl Thread {
     /// surfaced to the model so far this thread, sorted for stable display.
     /// See [`crate::nested_rules`].
     pub fn loaded_nested_rules(&self) -> Vec<Arc<Path>> {
-        let mut paths: Vec<Arc<Path>> =
-            self.loaded_nested_rules.lock().iter().cloned().collect();
+        let mut paths: Vec<Arc<Path>> = self.loaded_nested_rules.lock().iter().cloned().collect();
         paths.sort();
         paths
     }
@@ -4508,7 +4516,7 @@ mod tests {
     use language_model::LanguageModelToolUseId;
     use language_model::fake_provider::FakeLanguageModel;
     use serde_json::json;
-    use std::sync::Arc;
+    use std::{path::PathBuf, sync::Arc};
 
     async fn setup_thread_for_test(cx: &mut TestAppContext) -> (Entity<Thread>, ThreadEventStream) {
         cx.update(|cx| {
@@ -4560,6 +4568,62 @@ mod tests {
             }
             subagents
         })
+    }
+
+    #[gpui::test]
+    async fn test_loaded_nested_rules_roundtrips_through_thread_db(cx: &mut TestAppContext) {
+        let (thread, _event_stream) = setup_thread_for_test(cx).await;
+        let paths = vec![
+            PathBuf::from("/project/crates/foo/AGENTS.md"),
+            PathBuf::from("/project/crates/foo/bar/AGENTS.md"),
+        ];
+
+        cx.update(|cx| {
+            thread.update(cx, |thread, _cx| {
+                thread.loaded_nested_rules.lock().extend(
+                    paths
+                        .iter()
+                        .cloned()
+                        .map(|path| Arc::from(path.into_boxed_path())),
+                );
+            });
+        });
+
+        let db_thread = cx.update(|cx| thread.read(cx).to_db(cx)).await;
+        assert_eq!(db_thread.loaded_nested_rules, paths);
+
+        cx.update(|cx| {
+            LanguageModelRegistry::test(cx);
+        });
+
+        let restored = cx.update(|cx| {
+            let thread = thread.read(cx);
+            let project = thread.project.clone();
+            let project_context = thread.project_context.clone();
+            let context_server_registry = thread.context_server_registry.clone();
+            let templates = thread.templates.clone();
+
+            cx.new(|cx| {
+                Thread::from_db(
+                    acp::SessionId::new("thread-with-loaded-nested-rules"),
+                    db_thread,
+                    project,
+                    project_context,
+                    context_server_registry,
+                    templates,
+                    cx,
+                )
+            })
+        });
+
+        let restored_paths = restored.read_with(cx, |thread, _cx| {
+            thread
+                .loaded_nested_rules()
+                .into_iter()
+                .map(|path| path.as_ref().to_path_buf())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(restored_paths, paths);
     }
 
     struct ReplayImageTool;

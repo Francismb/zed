@@ -1,23 +1,22 @@
 use action_log::ActionLog;
 use agent_client_protocol::schema as acp;
 use anyhow::{Context as _, Result, anyhow};
+use collections::HashSet;
 use futures::FutureExt as _;
 use gpui::{App, Entity, SharedString, Task};
 use indoc::formatdoc;
 use language::Point;
 use language_model::{LanguageModelImage, LanguageModelImageExt, LanguageModelToolResultContent};
+use parking_lot::Mutex;
 use project::{AgentLocation, ImageItem, Project, WorktreeSettings, image_store};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use settings::Settings;
-use collections::HashSet;
-use parking_lot::Mutex;
 use std::path::Path;
 use std::sync::Arc;
-use util::ResultExt as _;
 use util::markdown::MarkdownCodeBlock;
 
-use crate::nested_rules::{discover_nested_rules, render_nested_rules};
+use crate::nested_rules::{discover_nested_rules, render_nested_rules, strip_nested_rules};
 
 fn tool_content_err(e: impl std::fmt::Display) -> LanguageModelToolResultContent {
     LanguageModelToolResultContent::from(e.to_string())
@@ -438,9 +437,23 @@ impl AgentTool for ReadFileTool {
                 )
             });
             let mut loaded_nested_rules = Vec::with_capacity(nested_rules.len());
+            let mut failed_nested_rules = Vec::new();
             for rule in &nested_rules {
-                if let Some(contents) = fs.load(rule.abs_path.as_ref()).await.log_err() {
-                    loaded_nested_rules.push((rule.display_path.as_str(), contents));
+                match fs.load(rule.abs_path.as_ref()).await {
+                    Ok(contents) => loaded_nested_rules.push((rule.display_path.as_str(), contents)),
+                    Err(error) => {
+                        log::error!(
+                            "failed to load nested rules file {}: {error:#}",
+                            rule.abs_path.display()
+                        );
+                        failed_nested_rules.push(rule.abs_path.clone());
+                    }
+                }
+            }
+            if !failed_nested_rules.is_empty() {
+                let mut loaded_nested_rules = self.loaded_nested_rules.lock();
+                for path in failed_nested_rules {
+                    loaded_nested_rules.remove(&path);
                 }
             }
             let nested_instructions = (!loaded_nested_rules.is_empty()).then(|| {
@@ -567,9 +580,10 @@ impl AgentTool for ReadFileTool {
         _cx: &mut App,
     ) -> Result<()> {
         if let LanguageModelToolResultContent::Text(text) = output {
+            let text = strip_nested_rules(&text);
             let markdown = MarkdownCodeBlock {
                 tag: &input.path,
-                text: &text,
+                text,
             }
             .to_string();
             event_stream.update_fields(acp::ToolCallUpdateFields::new().content(vec![
@@ -762,11 +776,139 @@ mod test {
         assert!(!top.contains("<nested_instructions>"), "{top}");
     }
 
+    #[gpui::test]
+    async fn test_read_file_retries_nested_rules_after_load_failure(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                "crates": {
+                    "foo": {
+                        "AGENTS.md": "",
+                        "baz.rs": "fn main() {}",
+                    },
+                },
+            }),
+        )
+        .await;
+        fs.insert_file(path!("/root/crates/foo/AGENTS.md"), vec![0xff])
+            .await;
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+        let action_log = cx.new(|_| ActionLog::new(project.clone()));
+        let tool = Arc::new(ReadFileTool::new(project, action_log, true));
+
+        let first = cx
+            .update(|cx| {
+                tool.clone().run(
+                    ToolInput::resolved(ReadFileToolInput {
+                        path: "root/crates/foo/baz.rs".into(),
+                        start_line: None,
+                        end_line: None,
+                    }),
+                    ToolCallEventStream::test().0,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        let first = result_text(first);
+        assert!(!first.contains("<nested_instructions>"), "{first}");
+        assert!(
+            tool.loaded_nested_rules.lock().is_empty(),
+            "failed nested rules must not be marked loaded"
+        );
+
+        fs.insert_file(path!("/root/crates/foo/AGENTS.md"), b"foo rules".to_vec())
+            .await;
+        let second = cx
+            .update(|cx| {
+                tool.run(
+                    ToolInput::resolved(ReadFileToolInput {
+                        path: "root/crates/foo/baz.rs".into(),
+                        start_line: None,
+                        end_line: None,
+                    }),
+                    ToolCallEventStream::test().0,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        let second = result_text(second);
+        assert!(second.contains("<nested_instructions>"), "{second}");
+        assert!(second.contains("foo rules"), "{second}");
+    }
+
+    #[gpui::test]
+    async fn test_read_file_replay_strips_nested_rules_from_ui(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                "crates": {
+                    "foo": {
+                        "baz.rs": "fn main() {}",
+                    },
+                },
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+        let action_log = cx.new(|_| ActionLog::new(project.clone()));
+        let tool = ReadFileTool::new(project, action_log, true);
+        let (event_stream, mut rx) = ToolCallEventStream::test();
+        let output = format!(
+            "{}     1\tfn main() {{}}",
+            crate::nested_rules::render_nested_rules([("root/crates/foo/AGENTS.md", "foo rules")])
+        );
+
+        cx.update(|cx| {
+            tool.replay(
+                ReadFileToolInput {
+                    path: "root/crates/foo/baz.rs".into(),
+                    start_line: None,
+                    end_line: None,
+                },
+                output.into(),
+                event_stream,
+                cx,
+            )
+            .unwrap();
+        });
+
+        let content_update = rx.expect_update_fields().await;
+        let text = text_from_content_update(content_update);
+        assert!(
+            text.starts_with("```root/crates/foo/baz.rs\n     1\tfn main() {}"),
+            "{text}"
+        );
+        assert!(!text.contains("<nested_instructions>"), "{text}");
+        assert!(!text.contains("foo rules"), "{text}");
+    }
+
     fn result_text(content: LanguageModelToolResultContent) -> String {
         match content {
             LanguageModelToolResultContent::Text(text) => text.to_string(),
             other => panic!("expected text tool result, got {other:?}"),
         }
+    }
+
+    fn text_from_content_update(update: acp::ToolCallUpdateFields) -> String {
+        let content_blocks = update.content.expect("expected content update");
+        let acp::ToolCallContent::Content(content) = content_blocks
+            .first()
+            .expect("expected at least one content block")
+        else {
+            panic!("expected ContentBlock, got {:?}", content_blocks.first());
+        };
+        let acp::ContentBlock::Text(text) = &content.content else {
+            panic!("expected text content block, got {:?}", content.content);
+        };
+        text.text.to_string()
     }
 
     #[gpui::test]

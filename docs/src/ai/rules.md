@@ -25,6 +25,9 @@ Other names for this file are also supported for compatibility with other agents
 - `CLAUDE.md`
 - `GEMINI.md`
 
+Rule files may also be placed in subdirectories. These nested rules are loaded on demand when the agent reads a file inside that directory tree, and they apply to work in that area of the project.
+When multiple nested rules apply, Zed loads them from the project root toward the file being read, and each nested rule file is added to a thread only once.
+
 ## Rules Library {#rules-library}
 
 The Rules Library is an interface for writing and managing rules.

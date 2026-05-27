@@ -167,6 +167,7 @@ mod tests {
             thinking_effort: None,
             draft_prompt: None,
             ui_scroll_position: None,
+            loaded_nested_rules: Vec::new(),
         }
     }
 
