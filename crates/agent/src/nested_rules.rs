@@ -20,7 +20,9 @@ const NESTED_INSTRUCTIONS_SUFFIX: &str = "</nested_instructions>\n\n";
 pub struct NestedRule {
     /// Worktree-qualified path used purely for display (e.g. `zed/crates/foo/AGENTS.md`).
     pub display_path: String,
-    /// Absolute path, used both as the deduplication key and to load the contents.
+    /// Path used to open the rule file through the project buffer store.
+    pub project_path: ProjectPath,
+    /// Absolute path, used as the deduplication key and for diagnostics.
     pub abs_path: Arc<Path>,
 }
 
@@ -83,6 +85,10 @@ pub fn discover_nested_rules(
                 worktree.root_name().as_unix_str(),
                 entry.path.as_unix_str(),
             ),
+            project_path: ProjectPath {
+                worktree_id: accessed_path.worktree_id,
+                path: entry.path.clone(),
+            },
             abs_path,
         });
     }

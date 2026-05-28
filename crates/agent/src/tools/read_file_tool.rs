@@ -439,11 +439,18 @@ impl AgentTool for ReadFileTool {
             let mut loaded_nested_rules = Vec::with_capacity(nested_rules.len());
             let mut failed_nested_rules = Vec::new();
             for rule in &nested_rules {
-                match fs.load(rule.abs_path.as_ref()).await {
-                    Ok(contents) => loaded_nested_rules.push((rule.display_path.as_str(), contents)),
+                let open_buffer_task = project.update(cx, |project, cx| {
+                    project.open_buffer(rule.project_path.clone(), cx)
+                });
+                match open_buffer_task.await {
+                    Ok(buffer) => {
+                        let rope = buffer.read_with(cx, |buffer, _cx| buffer.as_rope().clone());
+                        loaded_nested_rules
+                            .push((rule.display_path.as_str(), rope.to_string().trim().to_string()));
+                    }
                     Err(error) => {
                         log::error!(
-                            "failed to load nested rules file {}: {error:#}",
+                            "failed to open nested rules file {}: {error:#}",
                             rule.abs_path.display()
                         );
                         failed_nested_rules.push(rule.abs_path.clone());
@@ -606,6 +613,7 @@ mod test {
     use std::path::PathBuf;
     use std::sync::Arc;
     use util::path;
+    use util::rel_path::rel_path;
 
     #[gpui::test]
     async fn test_read_directory_path(cx: &mut TestAppContext) {
@@ -793,8 +801,11 @@ mod test {
             }),
         )
         .await;
-        fs.insert_file(path!("/root/crates/foo/AGENTS.md"), vec![0xff])
-            .await;
+        fs.insert_file(
+            path!("/root/crates/foo/AGENTS.md"),
+            b"RIFF\0\0\0\0WAVE".to_vec(),
+        )
+        .await;
         let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
         let action_log = cx.new(|_| ActionLog::new(project.clone()));
         let tool = Arc::new(ReadFileTool::new(project, action_log, true));
@@ -839,6 +850,62 @@ mod test {
         let second = result_text(second);
         assert!(second.contains("<nested_instructions>"), "{second}");
         assert!(second.contains("foo rules"), "{second}");
+    }
+
+    #[gpui::test]
+    async fn test_read_file_uses_open_buffer_for_nested_rules(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                "crates": {
+                    "foo": {
+                        "AGENTS.md": "disk rules",
+                        "baz.rs": "fn main() {}",
+                    },
+                },
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+        let action_log = cx.new(|_| ActionLog::new(project.clone()));
+        let tool = Arc::new(ReadFileTool::new(project.clone(), action_log, true));
+        let worktree = project.update(cx, |project, cx| {
+            project.worktrees(cx).next().expect("expected worktree")
+        });
+        let rules_buffer = project
+            .update(cx, |project, cx| {
+                project.open_buffer(
+                    (worktree.read(cx).id(), rel_path("crates/foo/AGENTS.md")),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        rules_buffer.update(cx, |buffer, cx| {
+            buffer.edit([(0..buffer.len(), "unsaved buffer rules")], None, cx);
+        });
+
+        let result = cx
+            .update(|cx| {
+                tool.run(
+                    ToolInput::resolved(ReadFileToolInput {
+                        path: "root/crates/foo/baz.rs".into(),
+                        start_line: None,
+                        end_line: None,
+                    }),
+                    ToolCallEventStream::test().0,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        let result = result_text(result);
+        assert!(result.contains("<nested_instructions>"), "{result}");
+        assert!(result.contains("unsaved buffer rules"), "{result}");
+        assert!(!result.contains("disk rules"), "{result}");
     }
 
     #[gpui::test]
